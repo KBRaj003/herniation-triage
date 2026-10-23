@@ -1,0 +1,20 @@
+name: Warm Build Cache
+"on":
+  schedule: [{cron: '0 3 * * 0'}]
+  workflow_dispatch:
+
+jobs:
+  warm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.buildozer
+            .buildozer
+            ~/.cache/pip
+          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'requirements.txt') }}
+          restore-keys: |
+            buildozer-${{ runner.os }}-
+      - run: echo "Cache touched, 7-day eviction timer reset."

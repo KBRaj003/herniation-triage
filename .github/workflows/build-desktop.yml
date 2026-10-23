@@ -1,0 +1,28 @@
+name: Build Desktop Executables
+"on":
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - run: pip install -r requirements.txt pyinstaller
+      - run: >
+          pyinstaller --onefile --windowed
+          --collect-all kivy
+          --hidden-import kivy.core.window
+          --name HerniationTriage main.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HerniationTriage-${{ matrix.os }}
+          path: dist/*
