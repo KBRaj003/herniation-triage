@@ -17,4 +17,4 @@ jobs:
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'requirements.txt') }}
           restore-keys: |
             buildozer-${{ runner.os }}-
-      - run: echo "Cache touched, 7-day eviction timer reset."
+      - run: echo "Cache touched."

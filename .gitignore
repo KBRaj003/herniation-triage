@@ -1,23 +1,14 @@
-# ---------- Python ----------
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
 build/
 dist/
 eggs/
 *.egg-info/
 *.egg
-.installed.cfg
-
-# ---------- Virtualenvs ----------
 .venv/
 venv/
 env/
-ENV/
-
-# ---------- Kivy / Buildozer / Android / Gradle ----------
 .buildozer/
 .gradle/
 gradle/
@@ -29,42 +20,26 @@ kivy_env/
 *.aab
 *.idsig
 bin/
-
-# ---------- JVM artifacts ----------
 *.class
 *.jar
 *.war
 *.ear
 *.aar
 target/
-
-# ---------- PyInstaller specs (KEEP buildozer.spec) ----------
 *.spec
 !buildozer.spec
-
-# ---------- Tests / coverage ----------
 .pytest_cache/
 .mypy_cache/
 .tox/
 .coverage
 htmlcov/
-
-# ---------- IDE ----------
 .idea/
 .vscode/
 *.iml
 *.swp
-*.swo
-
-# ---------- OS ----------
 .DS_Store
 Thumbs.db
-desktop.ini
-
-# ---------- Node ----------
 node_modules/
-
-# ---------- Local samples / scratch ----------
 sample_eeg.csv
 *.tmp
 *.log

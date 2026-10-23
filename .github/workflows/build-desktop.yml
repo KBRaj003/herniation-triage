@@ -16,12 +16,32 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-      - run: pip install -r requirements.txt pyinstaller
-      - run: >
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Patch kivy.garden __path__
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib, sysconfig
+          init = pathlib.Path(sysconfig.get_paths()["purelib"]) / "kivy" / "garden" / "__init__.py"
+          if init.exists():
+              txt = init.read_text()
+              if "__path__ = 'kivy.garden'" in txt:
+                  txt = txt.replace("__path__ = 'kivy.garden'",
+                                    "__path__ = [__import__('os').path.dirname(__file__)]")
+                  init.write_text(txt); print(f"patched {init}")
+              else: print("already patched")
+          else: print("kivy.garden not present")
+          PY
+      - name: Build executable
+        run: >
           pyinstaller --onefile --windowed
-          --collect-all kivy
+          --name HerniationTriage
           --hidden-import kivy.core.window
-          --name HerniationTriage main.py
+          --collect-data kivy
+          --collect-binaries kivy
+          --exclude-module kivy.garden
+          main.py
       - uses: actions/upload-artifact@v4
         with:
           name: HerniationTriage-${{ matrix.os }}

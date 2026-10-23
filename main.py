@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # main.py -- Herniation Risk Triage.
-# One command: `python main.py bootstrap` -> GitHub builds everything.
 # Research prototype. Not a medical device.
+#
+# NOTE: there is NO `run` command.  HRI/BSI/DAR replay only happens
+# inside the APK / desktop exe GUI, never in the terminal.
+# The only command you ever need is `bootstrap`.
 
 import argparse, csv, os, re, shlex, shutil, subprocess, sys, tempfile, threading, time
 from collections import deque
@@ -9,19 +12,22 @@ from pathlib import Path
 
 try:
     import numpy as np
+    _NP_OK = True
 except ImportError:
-    sys.stderr.write("ERROR: numpy required.  pip install 'numpy>=1.24,<3'\n"); sys.exit(1)
+    np = None
+    _NP_OK = False
 
-if hasattr(np, "trapezoid"):
-    _trapz = np.trapezoid
-elif hasattr(np, "trapz"):
-    _trapz = np.trapz
+if _NP_OK:
+    if hasattr(np, "trapezoid"): _trapz = np.trapezoid
+    elif hasattr(np, "trapz"):   _trapz = np.trapz
+    else:
+        def _trapz(y, x=None, dx=1.0):
+            y = np.asarray(y, dtype=float)
+            x = (np.asarray(x, dtype=float) if x is not None
+                 else np.arange(len(y), dtype=float) * dx)
+            return float(np.sum((y[1:] + y[:-1]) * 0.5 * np.diff(x)))
 else:
-    def _trapz(y, x=None, dx=1.0):
-        y = np.asarray(y, dtype=float)
-        x = (np.asarray(x, dtype=float) if x is not None
-             else np.arange(len(y), dtype=float) * dx)
-        return float(np.sum((y[1:] + y[:-1]) * 0.5 * np.diff(x)))
+    _trapz = None
 
 try:
     from scipy.signal import butter, filtfilt, iirnotch, welch
@@ -44,9 +50,7 @@ PROFILES = {
 CFG = dict(PROFILES["desktop"])
 ARTIFACT_LIMIT_V = 100e-6
 
-# --------------------------------------------------------------------
-# Signal processing
-# --------------------------------------------------------------------
+# ==================== Signal processing ====================
 
 def _bandpass(low, high, fs, order=4):
     nyq = 0.5 * fs
@@ -66,23 +70,24 @@ def preprocess(window, fs, use_notch=True):
     if np.any(np.abs(out) > ARTIFACT_LIMIT_V): return None
     return out
 
-def _band_power(sig, fs, band):
-    if not SCIPY_OK: return float(np.var(sig) + 1e-12)
-    f, pxx = welch(sig, fs=fs, nperseg=min(len(sig), 256))
-    idx = (f >= band[0]) & (f <= band[1])
-    if not np.any(idx): return 1e-12
-    return float(_trapz(pxx[idx], f[idx]))
-
 def extract_features(window, fs):
-    left = window[:, 0]
+    left  = window[:, 0]
     right = window[:, 1] if window.shape[1] > 1 else window[:, 0]
     bands = {"delta": (0.5, 4), "theta": (4, 8),
              "alpha": (8, 13), "beta": (13, 30)}
-    p = {k: _band_power(left, fs, b) + _band_power(right, fs, b)
-         for k, b in bands.items()}
+    if SCIPY_OK:
+        nper = min(len(left), 256)
+        f_l, pxx_l = welch(left,  fs=fs, nperseg=nper)
+        f_r, pxx_r = welch(right, fs=fs, nperseg=nper)
+        def bp(f, pxx, band):
+            idx = (f >= band[0]) & (f <= band[1])
+            return float(_trapz(pxx[idx], f[idx])) if np.any(idx) else 1e-12
+        p = {k: bp(f_l, pxx_l, b) + bp(f_r, pxx_r, b) for k, b in bands.items()}
+        la = bp(f_l, pxx_l, bands["alpha"]); ra = bp(f_r, pxx_r, bands["alpha"])
+    else:
+        v = float(np.var(left) + np.var(right) + 1e-12)
+        p = {k: v for k in bands}; la = ra = v
     dar_log = float(np.log10(p["delta"] / (p["alpha"] + 1e-12) + 1e-12))
-    la = _band_power(left, fs, bands["alpha"])
-    ra = _band_power(right, fs, bands["alpha"])
     bsi = float(np.abs(la - ra) / (la + ra + 1e-12))
     try:
         el, er = np.abs(left), np.abs(right)
@@ -98,9 +103,7 @@ def compute_hri(f):
     pers_s = 1.0 - f["persistence"]
     return float(np.clip(0.45 * dar_s + 0.35 * bsi_s + 0.20 * pers_s, 0, 1))
 
-# --------------------------------------------------------------------
-# EEG source + pipeline
-# --------------------------------------------------------------------
+# ==================== CSV source + pipeline ====================
 
 def _load_csv(path, target_fs, file_fs=None):
     with path.open("r", newline="") as f:
@@ -108,8 +111,7 @@ def _load_csv(path, target_fs, file_fs=None):
     has_header = any(ch.isalpha() for ch in first_line)
     try:
         arr = np.loadtxt(str(path), delimiter=",",
-                         skiprows=1 if has_header else 0,
-                         ndmin=2, dtype=float)
+                         skiprows=1 if has_header else 0, ndmin=2, dtype=float)
     except ValueError as e:
         raise ValueError(f"{path}: not a numeric CSV ({e})")
     if arr.shape[0] < 8:
@@ -168,11 +170,15 @@ class Pipeline:
         self.running = True
         threading.Thread(target=self._run, daemon=True).start()
     def _run(self):
-        fs = self.cfg["fs"]
+        fs = self.cfg["fs"]; prev_pos = 0
         try:
             while self.running:
                 chunk = self.source.read(self.step_samples)
                 if chunk is None: break
+                cur_pos = getattr(self.source, "_pos", 0)
+                if self.source.loop and cur_pos < prev_pos:
+                    self._buf = None; self.alarm_counter = 0
+                prev_pos = cur_pos
                 self._buf = (chunk if self._buf is None
                              else np.vstack([self._buf, chunk]))
                 if len(self._buf) > self.window_samples * 2:
@@ -192,14 +198,37 @@ class Pipeline:
             self.running = False
     def stop(self): self.running = False
 
-# --------------------------------------------------------------------
-# GUI
-# --------------------------------------------------------------------
+# ==================== GUI (only runs inside APK / exe) ====================
 
-def run_gui(cfg, csv_path, loop):
+def _launch_gui(profile="desktop"):
+    """Run GUI with auto-generated sample. Used by APK and desktop exe."""
+    if not _NP_OK:
+        msg = "ERROR: numpy missing. Install: pip install numpy scipy"
+        sys.stderr.write(msg + "\n")
+        try:
+            from kivy.app import App
+            from kivy.uix.label import Label
+            class E(App):
+                def build(self): return Label(text=msg)
+            E().run()
+        except Exception: pass
+        return 1
+    CFG.update(PROFILES[profile])
     if _try_import("kivy") is None:
-        sys.stderr.write("[WARN] Kivy not installed; falling back to CLI.\n")
-        return run_cli(cfg, csv_path, loop)
+        sys.stderr.write("ERROR: Kivy not installed.\n")
+        return 1
+    sample = Path("sample_eeg.csv")
+    if not sample.exists():
+        try: make_sample(path=sample, fs=CFG["fs"], seconds=30)
+        except Exception as e: print(f"[gui] sample gen failed: {e}")
+    if not sample.exists():
+        try:
+            with sample.open("w", newline="") as f:
+                w = csv.writer(f); w.writerow(["t", "ch1", "ch2"])
+                for i in range(200):
+                    w.writerow([f"{i/200:.6f}", "0.000020", "0.000020"])
+        except Exception as e: print(f"[gui] fallback CSV failed: {e}")
+
     from kivy.app import App
     from kivy.clock import Clock
     from kivy.graphics import Color, Line, Rectangle
@@ -208,7 +237,7 @@ def run_gui(cfg, csv_path, loop):
     from kivy.uix.gridlayout import GridLayout
     from kivy.uix.label import Label
     from kivy.uix.widget import Widget
-    ws = int(cfg["fs"] * cfg["window_sec"])
+    ws = int(CFG["fs"] * CFG["window_sec"])
 
     class EEGPlot(Widget):
         def __init__(self, **kw):
@@ -220,7 +249,7 @@ def run_gui(cfg, csv_path, loop):
                 Color(0.2, 0.8, 0.2); self.line_l = Line(points=[], width=1.2)
                 Color(0.8, 0.3, 0.3); self.line_r = Line(points=[], width=1.2)
             self.bind(pos=self._resize, size=self._resize)
-            Clock.schedule_interval(self._draw, 1.0 / cfg["update_hz"])
+            Clock.schedule_interval(self._draw, 1.0 / CFG["update_hz"])
         def _resize(self, *_):
             self._bg.pos, self._bg.size = self.pos, self.size
         def add(self, win):
@@ -238,10 +267,9 @@ def run_gui(cfg, csv_path, loop):
                 line.points = [(float(x), float(v)) for x, v in zip(xs, yp)]
 
     class Root(BoxLayout):
-        def __init__(self, cfg, csv_path, loop, **kw):
+        def __init__(self, **kw):
             super().__init__(orientation="vertical", **kw)
-            self.cfg, self.csv_path, self.loop = cfg, csv_path, loop
-            self.status = Label(text="Ready - press Start", size_hint=(1, 0.07))
+            self.status = Label(text="Starting...", size_hint=(1, 0.07))
             self.add_widget(self.status)
             self.plot = EEGPlot(size_hint=(1, 0.55)); self.add_widget(self.plot)
             g = GridLayout(cols=4, size_hint=(1, 0.15))
@@ -259,13 +287,11 @@ def run_gui(cfg, csv_path, loop):
         def start(self, *_):
             if self.pipe and self.pipe.running: return
             try:
-                self.source = CSVSource(self.csv_path, self.cfg["fs"],
-                                        file_fs=self.cfg.get("_file_fs"),
-                                        loop=self.loop)
+                self.source = CSVSource(sample, CFG["fs"], loop=True)
             except Exception as e:
                 self.status.text = f"ERROR: {e}"; return
-            self.pipe = Pipeline(self.source, self.cfg, self._on_result)
-            self.pipe.start(); self.status.text = f"Replaying {self.csv_path.name}"
+            self.pipe = Pipeline(self.source, CFG, self._on_result)
+            self.pipe.start(); self.status.text = f"Replaying {sample.name}"
         def stop(self, *_):
             if self.pipe: self.pipe.stop()
             if self.source: self.source.stop()
@@ -282,64 +308,19 @@ def run_gui(cfg, csv_path, loop):
                 self.alarm.text = "OK"; self.alarm.color = (0, 1, 0, 1)
 
     class TriApp(App):
-        def __init__(self, cfg, csv_path, loop, **kw):
-            super().__init__(**kw); self.cfg, self.csv_path, self.loop = cfg, csv_path, loop
         def build(self):
             self.title = "Herniation Triage (Research Prototype)"
-            return Root(self.cfg, self.csv_path, self.loop)
+            root = Root()
+            Clock.schedule_once(lambda dt: root.start(), 0.5)
+            return root
 
-    TriApp(cfg, csv_path, loop).run()
-
-# --------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------
-
-def run_cli(cfg, csv_path, loop):
-    print(f"[CLI] Replaying {csv_path} (Ctrl+C to stop)...")
-    try:
-        src = CSVSource(csv_path, cfg["fs"], file_fs=cfg.get("_file_fs"), loop=loop)
-    except Exception as e:
-        sys.stderr.write(f"[CLI] cannot load file: {e}\n"); return 1
-    def cb(_w, feats, hri, alarm):
-        tag = "ALARM" if alarm else "  ok "
-        print(f"[{time.strftime('%H:%M:%S')}] HRI={hri:.3f} "
-              f"BSI={feats['BSI']:.3f} DAR={feats['DAR_log']:+.2f} {tag}")
-    pipe = Pipeline(src, cfg, cb); pipe.start()
-    try:
-        while pipe.running: time.sleep(0.5)
-    except KeyboardInterrupt: print("\n[CLI] Stopped")
-    finally: pipe.stop(); src.stop()
-    return 0
-
-def run_selftest(_cfg):
-    print("[selftest] verifying core functions...")
-    big = np.full((500, 2), 1e-3)
-    if preprocess(big, 250) is not None:
-        print("[selftest] FAIL: artifact not rejected"); return 1
-    rng = np.random.default_rng(0)
-    normal = 20e-6 * rng.standard_normal((500, 2))
-    if preprocess(normal, 250) is None:
-        print("[selftest] FAIL: normal window rejected"); return 1
-    hri = compute_hri({"DAR_log": 0.0, "BSI": 0.0, "persistence": 1.0})
-    if not (0.0 <= hri <= 1.0):
-        print(f"[selftest] FAIL: HRI out of range: {hri}"); return 1
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv",
-                                     delete=False, newline="") as f:
-        w = csv.writer(f); w.writerow(["t", "ch1", "ch2"])
-        for i in range(500):
-            w.writerow([f"{i/250:.6f}", "0.000020", "0.000020"])
-        tmp = Path(f.name)
-    try:
-        arr, fs = _load_csv(tmp, 250)
-        if arr.shape != (500, 2):
-            print(f"[selftest] FAIL: loader shape={arr.shape}"); return 1
-        if abs(fs - 250) > 1:
-            print(f"[selftest] FAIL: loader fs={fs}"); return 1
-    finally: tmp.unlink(missing_ok=True)
-    print("[selftest] OK - all core functions verified")
+    TriApp().run()
     return 0
 
 def make_sample(path=Path("sample_eeg.csv"), fs=250, seconds=60, seed=42):
+    if not _NP_OK:
+        sys.stderr.write("ERROR: numpy required for make-sample.\n"); return None
+    path = Path(path)
     if path.exists(): print(f"  (overwriting {path})")
     n = int(fs * seconds); rng = np.random.default_rng(seed)
     t = np.arange(n) / fs
@@ -354,11 +335,15 @@ def make_sample(path=Path("sample_eeg.csv"), fs=250, seconds=60, seed=42):
             w.writerow([f"{t[i]:.6f}", f"{left[i]:.9f}", f"{right[i]:.9f}"])
     kb = path.stat().st_size // 1024
     print(f"Wrote {path} ({n} rows, {seconds}s @ {fs} Hz, ~{kb} KB)")
-    print(f"  Run:  python main.py run --file {path.name}")
+    return path
 
-# --------------------------------------------------------------------
-# Scaffold constants
-# --------------------------------------------------------------------
+# ==================== Android detection ====================
+
+def _is_apk_runtime():
+    """True ONLY inside a p4a-built APK (not on plain Termux)."""
+    return "P4A_BOOTSTRAP" in os.environ or "ANDROID_ARGUMENT" in os.environ
+
+# ==================== Scaffold constants ====================
 
 REQUIREMENTS_TXT = "kivy>=2.3.0,<2.4\nnumpy>=1.24,<3\nscipy>=1.10,<1.15\n"
 
@@ -373,9 +358,14 @@ version = 0.1
 requirements = python3,kivy==2.3.0,numpy==1.26.4
 orientation = portrait
 fullscreen = 0
+android.api = 33
+android.minapi = 21
+android.ndk = 25b
 android.archs = arm64-v8a
 android.accept_sdk_license = True
+android.numeric_version = 1
 android.no_compile_py = 1
+android.permissions = 
 
 [buildozer]
 log_level = 2
@@ -383,26 +373,17 @@ warn_on_root = 1
 """
 
 GITIGNORE = """\
-# ---------- Python ----------
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
 build/
 dist/
 eggs/
 *.egg-info/
 *.egg
-.installed.cfg
-
-# ---------- Virtualenvs ----------
 .venv/
 venv/
 env/
-ENV/
-
-# ---------- Kivy / Buildozer / Android / Gradle ----------
 .buildozer/
 .gradle/
 gradle/
@@ -414,42 +395,26 @@ kivy_env/
 *.aab
 *.idsig
 bin/
-
-# ---------- JVM artifacts ----------
 *.class
 *.jar
 *.war
 *.ear
 *.aar
 target/
-
-# ---------- PyInstaller specs (KEEP buildozer.spec) ----------
 *.spec
 !buildozer.spec
-
-# ---------- Tests / coverage ----------
 .pytest_cache/
 .mypy_cache/
 .tox/
 .coverage
 htmlcov/
-
-# ---------- IDE ----------
 .idea/
 .vscode/
 *.iml
 *.swp
-*.swo
-
-# ---------- OS ----------
 .DS_Store
 Thumbs.db
-desktop.ini
-
-# ---------- Node ----------
 node_modules/
-
-# ---------- Local samples / scratch ----------
 sample_eeg.csv
 *.tmp
 *.log
@@ -458,37 +423,10 @@ sample_eeg.csv
 README_MD = """\
 # Herniation Risk Triage (Research Prototype)
 
-Single-file EEG file-replay pipeline. No simulation, no external sensors.
-
-## The one command you need
-
     python main.py bootstrap
 
-That's it. Installs `git`/`gh` if missing, authenticates via `gh auth login`
-or `GH_TOKEN`, scaffolds the project, detects & removes poisoned git history
-(large blobs from previous attempts), commits, creates the GitHub repo,
-pushes, tags `v1.0.0`, and GitHub Actions builds desktop exes + Android APK.
-
-## Get artifacts (after bootstrap)
-
-Open:  https://github.com/<you>/<repo>/actions
-
-  - `HerniationTriage-ubuntu-latest` / `-windows-latest`  (desktop)
-  - `HerniationTriage-Android`                             (APK)
-
-## Local development (optional)
-
-    python main.py make-sample
-    python main.py run --file sample_eeg.csv --cli
-    python main.py run --file sample_eeg.csv          # GUI (needs kivy)
-    python main.py selftest
-
-## If a previous bootstrap poisoned your history
-
-    python main.py clean-history           # auto-detect + fix
-    python main.py bootstrap --nuke-history
-
-## Research prototype only. Not a medical device.
+Pushes to GitHub; Actions builds desktop executables + Android APK.
+Not a medical device.
 """
 
 DESKTOP_WORKFLOW = """\
@@ -510,12 +448,32 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-      - run: pip install -r requirements.txt pyinstaller
-      - run: >
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+      - name: Patch kivy.garden __path__
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib, sysconfig
+          init = pathlib.Path(sysconfig.get_paths()["purelib"]) / "kivy" / "garden" / "__init__.py"
+          if init.exists():
+              txt = init.read_text()
+              if "__path__ = 'kivy.garden'" in txt:
+                  txt = txt.replace("__path__ = 'kivy.garden'",
+                                    "__path__ = [__import__('os').path.dirname(__file__)]")
+                  init.write_text(txt); print(f"patched {init}")
+              else: print("already patched")
+          else: print("kivy.garden not present")
+          PY
+      - name: Build executable
+        run: >
           pyinstaller --onefile --windowed
-          --collect-all kivy
+          --name HerniationTriage
           --hidden-import kivy.core.window
-          --name HerniationTriage main.py
+          --collect-data kivy
+          --collect-binaries kivy
+          --exclude-module kivy.garden
+          main.py
       - uses: actions/upload-artifact@v4
         with:
           name: HerniationTriage-${{ matrix.os }}
@@ -534,8 +492,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Restore Buildozer cache (GitHub-managed)
+      - name: Restore Buildozer cache
         id: cache
         uses: actions/cache@v4
         with:
@@ -546,24 +503,17 @@ jobs:
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'requirements.txt') }}
           restore-keys: |
             buildozer-${{ runner.os }}-
-
       - name: Report cache status
         run: |
-          echo "============= CACHE STATUS ============="
           if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
-            echo "CACHE HIT -- reusing previously downloaded NDK/SDK/p4a"
-            echo "Expected Android build time: ~6-10 minutes"
+            echo "CACHE HIT -- ~6-10 min"
           else
-            echo "CACHE MISS -- cold build, will download NDK/SDK/p4a"
-            echo "Expected Android build time: ~35-45 minutes"
+            echo "CACHE MISS -- ~35-45 min"
           fi
-          ls -d "$HOME/.buildozer/android/platform/android-ndk"* 2>/dev/null || true
           du -sh "$HOME/.buildozer" 2>/dev/null || true
-
       - name: Prepare cache dirs
         run: mkdir -p "$HOME/.buildozer" "$HOME/.cache/pip"
-
-      - name: Build APK (GitHub runner, Docker + cached volumes)
+      - name: Build APK
         run: |
           docker run --rm \\
             --volume "$PWD":/home/user/hostcwd \\
@@ -572,9 +522,7 @@ jobs:
             --workdir /home/user/hostcwd \\
             kivy/buildozer:latest \\
             buildozer -v android debug
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: HerniationTriage-Android
           path: bin/*.apk
@@ -600,7 +548,7 @@ jobs:
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'requirements.txt') }}
           restore-keys: |
             buildozer-${{ runner.os }}-
-      - run: echo "Cache touched, 7-day eviction timer reset."
+      - run: echo "Cache touched."
 """
 
 def _write(path, content):
@@ -612,8 +560,7 @@ def _ensure_main_py():
     if getattr(sys, "frozen", False): return
     src = Path(__file__).resolve(); target = Path("main.py").resolve()
     if src == target: return
-    shutil.copy2(src, Path("main.py"))
-    print("  synced main.py")
+    shutil.copy2(src, Path("main.py")); print("  synced main.py")
 
 def cmd_setup_github():
     root = Path.cwd()
@@ -628,47 +575,13 @@ def cmd_setup_github():
     _ensure_main_py()
     print("[setup-github] done.")
 
-# --------------------------------------------------------------------
-# Optional local builds
-# --------------------------------------------------------------------
-
-def _pip_install(*pkgs):
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", *pkgs])
-    except subprocess.CalledProcessError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--user", *pkgs])
-
-def cmd_build_desktop_local():
-    print("[build-desktop:LOCAL] OPTIONAL.  CI does this for you after bootstrap.")
-    _pip_install("pyinstaller")
-    subprocess.check_call([
-        sys.executable, "-m", "PyInstaller",
-        "--onefile", "--windowed",
-        "--collect-all", "kivy",
-        "--hidden-import", "kivy.core.window",
-        "--name", "HerniationTriage",
-        "--distpath", "dist", "--workpath", "build", "--specpath", ".",
-        str(Path(__file__).resolve()),
-    ])
-    for f in Path("dist").iterdir(): print(f"  {f}")
-
-def cmd_build_android_local():
-    print("[build-android:LOCAL] OPTIONAL.  CI does this for you after bootstrap.")
-    _pip_install("buildozer", "cython")
-    if not Path("buildozer.spec").exists(): cmd_setup_github()
-    _ensure_main_py()
-    subprocess.check_call(["buildozer", "-v", "android", "debug"])
-
-# ====================================================================
-# GIT LOGGING LAYER
-# ====================================================================
+# ==================== Git logging ====================
 
 _LOG = {"git": True}
 _PUSH_LAST_ERR = {"stderr": "", "code": 0}
 
 def _git_log(msg, kind="info"):
-    if not _LOG["git"]:
-        return
+    if not _LOG["git"]: return
     tag = {"info": "[git]", "cmd": "[git]", "ok": "[git-ok]",
            "warn": "[git-warn]", "err": "[git-err]"}.get(kind, "[git]")
     print(f"{tag} {time.strftime('%H:%M:%S')} {msg}", flush=True)
@@ -682,39 +595,30 @@ def _run(cmd, **kw):
     return subprocess.run(cmd, **kw)
 
 def _git(*args, quiet=False, timeout=600, stream=False, **kw):
-    """Run git, log everything (unless quiet/stream)."""
     cmd = ["git", *args]
-    # streaming mode for push/pull/fetch/clone --live progress
     if stream and not quiet:
         stream_cmd = [*cmd, "--progress"]
         _git_log(f"$ {_fmt_cmd(stream_cmd)}  (streaming)")
         t0 = time.time()
-        try:
-            r = subprocess.run(stream_cmd, timeout=timeout)
+        try: r = subprocess.run(stream_cmd, timeout=timeout)
         except subprocess.TimeoutExpired:
             _git_log(f"$ {_fmt_cmd(stream_cmd)}  TIMEOUT", "err"); raise
         _git_log(f"  exit={r.returncode} {time.time()-t0:.1f}s",
                  "ok" if r.returncode == 0 else "err")
         return r
-
     kw["capture_output"] = True; kw["text"] = True; kw["timeout"] = timeout
     t0 = time.time()
-    try:
-        r = subprocess.run(cmd, **kw)
+    try: r = subprocess.run(cmd, **kw)
     except subprocess.TimeoutExpired:
-        _git_log(f"$ {_fmt_cmd(cmd)}  TIMEOUT after {timeout}s", "err")
-        raise
+        _git_log(f"$ {_fmt_cmd(cmd)}  TIMEOUT", "err"); raise
     dur = time.time() - t0
-    if quiet:
-        return r
-
+    if quiet: return r
     ok = r.returncode == 0
     _git_log(f"$ {_fmt_cmd(cmd)}  [{'ok' if ok else 'FAIL=' + str(r.returncode)} {dur:.2f}s]",
              "cmd" if ok else "err")
-
-    if args and args[0] in ("push", "pull", "fetch", "clone", "commit", "tag",
-                            "merge", "rebase", "ls-remote", "remote", "add",
-                            "rm", "reset", "checkout", "init", "config"):
+    if args and args[0] in ("push","pull","fetch","clone","commit","tag",
+                            "merge","rebase","ls-remote","remote","add",
+                            "rm","reset","checkout","init","config"):
         for line in (r.stdout or "").rstrip().splitlines()[:12]:
             _git_log(f"  {line}", "cmd" if ok else "err")
         for line in (r.stderr or "").rstrip().splitlines()[:12]:
@@ -722,8 +626,6 @@ def _git(*args, quiet=False, timeout=600, stream=False, **kw):
     elif not ok:
         for line in ((r.stderr or r.stdout or "")).rstrip().splitlines()[:12]:
             _git_log(f"  {line}", "err")
-
-    # remember push stderr for GH001 detection
     if args and args[0] == "push":
         _PUSH_LAST_ERR["stderr"] = r.stderr or ""
         _PUSH_LAST_ERR["code"] = r.returncode
@@ -732,32 +634,21 @@ def _git(*args, quiet=False, timeout=600, stream=False, **kw):
 def _gh(*args, **kw):
     return _run(["gh", *args], **kw)
 
-# ====================================================================
-# JUNK / WHITELIST HELPERS
-# ====================================================================
+# ==================== Junk helpers ====================
 
 JUNK_DIR_NAMES = {
-    ".gradle", "gradle", "Android", "android", ".buildozer",
-    "bin", "dist", "build", "__pycache__", ".venv", "venv", "env",
-    "node_modules", ".pytest_cache", ".mypy_cache", ".tox",
-    ".idea", ".vscode", "target", "kivy_env", ".kivy_env",
-    "eggs", "htmlcov",
+    ".gradle","gradle","Android","android",".buildozer","bin","dist","build",
+    "__pycache__",".venv","venv","env","node_modules",".pytest_cache",
+    ".mypy_cache",".tox",".idea",".vscode","target","kivy_env",".kivy_env",
+    "eggs","htmlcov",
 }
 JUNK_FILE_SUFFIXES = {".pyc", ".pyo", ".spec"}
 JUNK_FILE_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 JUNK_FILE_PREFIXES = (".env.",)
-
-SAFE_PATHS = [
-    "main.py",
-    "requirements.txt",
-    "buildozer.spec",
-    ".gitignore",
-    "README.md",
-    ".github",
-]
+SAFE_PATHS = ["main.py","requirements.txt","buildozer.spec",
+              ".gitignore","README.md",".github"]
 
 def _safe_paths():
-    """SAFE_PATHS + any paths in .bootstrap-include."""
     paths = list(SAFE_PATHS)
     inc = Path(".bootstrap-include")
     if inc.exists():
@@ -766,56 +657,42 @@ def _safe_paths():
                 line = line.strip()
                 if line and not line.startswith("#"):
                     paths.append(line)
-        except OSError:
-            pass
+        except OSError: pass
     return paths
 
 def _in_home_dir():
-    try:
-        return Path.cwd().resolve() == Path.home().resolve()
-    except OSError:
-        return False
+    try: return Path.cwd().resolve() == Path.home().resolve()
+    except OSError: return False
 
 def _is_junk(path_str):
     p = Path(path_str)
-    if p.name in JUNK_FILE_NAMES:
-        return True
-    if p.name == "buildozer.spec":
-        return False
-    if p.suffix in JUNK_FILE_SUFFIXES:
-        return True
-    if any(p.name.startswith(pref) for pref in JUNK_FILE_PREFIXES):
-        return True
+    if p.name in JUNK_FILE_NAMES: return True
+    if p.name == "buildozer.spec": return False
+    if p.suffix in JUNK_FILE_SUFFIXES: return True
+    if any(p.name.startswith(pref) for pref in JUNK_FILE_PREFIXES): return True
     for part in p.parts[:-1]:
-        if part in JUNK_DIR_NAMES:
-            return True
+        if part in JUNK_DIR_NAMES: return True
     return False
 
 def _untrack_junk():
-    """git rm --cached any tracked junk matching our .gitignore."""
     head = _git("rev-parse", "--verify", "HEAD", quiet=True)
-    if head.returncode != 0:
-        return
+    if head.returncode != 0: return
     r = _git("ls-files", quiet=True)
-    if r.returncode != 0:
-        return
+    if r.returncode != 0: return
     junk = [f for f in r.stdout.splitlines() if _is_junk(f)]
     if not junk:
-        _git_log("no tracked junk found", "ok")
-        return
-    _git_log(f"untracking {len(junk)} junk file(s) from index:", "warn")
+        _git_log("no tracked junk found", "ok"); return
+    _git_log(f"untracking {len(junk)} junk file(s):", "warn")
     for f in junk[:10]: _git_log(f"  - {f}", "warn")
     if len(junk) > 10: _git_log(f"  ... and {len(junk) - 10} more", "warn")
     for i in range(0, len(junk), 200):
-        batch = junk[i:i+200]
-        _git("rm", "--cached", "--ignore-unmatch", "--", *batch, quiet=True)
-    _git_log(f"untracked {len(junk)} file(s) from index (commit will record)", "ok")
+        _git("rm", "--cached", "--ignore-unmatch", "--",
+             *junk[i:i+200], quiet=True)
+    _git_log(f"untracked {len(junk)} file(s)", "ok")
 
 def _repo_health_check():
-    """Refuse push if any tracked file > 100 MB; warn if > 40 MB."""
     r = _git("ls-files", "-z", quiet=True)
-    if r.returncode != 0:
-        return True
+    if r.returncode != 0: return True
     files = [f for f in r.stdout.split("\0") if f and Path(f).is_file()]
     if not files: return True
     sizes = []
@@ -833,44 +710,32 @@ def _repo_health_check():
             _git_log(f"  {tag}: {f} = {s/1024/1024:.1f} MB",
                      "err" if s > 100 * 1024 * 1024 else "warn")
     if blocked:
-        _git_log(f"{len(blocked)} file(s) exceed GitHub's 100 MB limit", "err")
-        return False
+        _git_log(f"{len(blocked)} file(s) exceed 100 MB", "err"); return False
     return True
 
-# ====================================================================
-# HISTORY INSPECTION  -- the fix for GH001
-# ====================================================================
+# ==================== History inspection / surgery ====================
 
 def _remote_has_commits(url):
-    """True=populated, False=empty, None=unknown (network)."""
     if not url: return None
     r = _git("ls-remote", "--heads", url, quiet=True, timeout=30)
     if r.returncode != 0: return None
     return bool(r.stdout.strip())
 
 def _history_has_blobs_over(max_mb):
-    """Return list of (size_bytes, oid) for blobs > max_mb in ALL history."""
     r = _git("rev-list", "--objects", "--all", quiet=True)
-    if r.returncode != 0 or not r.stdout.strip():
-        return []
-    oids = []
-    for line in r.stdout.splitlines():
-        parts = line.split(" ", 1)
-        if parts and len(parts[0]) == 40:
-            oids.append(parts[0])
-    if not oids:
-        return []
-    inp = "\n".join(oids) + "\n"
+    if r.returncode != 0 or not r.stdout.strip(): return []
+    oids = [line.split(" ", 1)[0] for line in r.stdout.splitlines()
+            if line and len(line.split(" ", 1)[0]) == 40]
+    if not oids: return []
     try:
         r2 = subprocess.run(
             ["git", "cat-file",
              "--batch-check=%(objecttype) %(objectsize) %(objectname)"],
-            input=inp, capture_output=True, text=True, timeout=180)
+            input="\n".join(oids) + "\n",
+            capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
-        _git_log("cat-file timeout while inspecting history", "warn")
-        return []
-    if r2.returncode != 0:
-        return []
+        _git_log("cat-file timeout", "warn"); return []
+    if r2.returncode != 0: return []
     threshold = max_mb * 1024 * 1024
     big = []
     for line in r2.stdout.splitlines():
@@ -878,98 +743,102 @@ def _history_has_blobs_over(max_mb):
         if len(parts) >= 3 and parts[0] == "blob":
             try:
                 size = int(parts[1])
-                if size > threshold:
-                    big.append((size, parts[2]))
-            except ValueError:
-                pass
+                if size > threshold: big.append((size, parts[2]))
+            except ValueError: pass
     return big
 
-# ====================================================================
-# HISTORY SURGERY
-# ====================================================================
-
 def _nuke_git_and_reinit(branch="main"):
-    """Delete .git entirely and git init.  Safe ONLY if remote is empty."""
     git_dir = Path(".git")
     if git_dir.is_dir():
         try:
             size_mb = sum(f.stat().st_size for f in git_dir.rglob("*")
                           if f.is_file()) / 1024 / 1024
-        except OSError:
-            size_mb = 0.0
-        print(f"[nuke] removing .git directory ({size_mb:.1f} MB)")
+        except OSError: size_mb = 0.0
+        print(f"[nuke] removing .git ({size_mb:.1f} MB)")
         shutil.rmtree(git_dir)
     _git("init", "-b", branch)
-    _git_log("fresh git repository initialized", "ok")
+    _git_log("fresh git repo initialized", "ok")
 
 def _purge_large_blobs(url, max_mb=40):
-    """Strip blobs > max_mb from ALL history using git-filter-repo."""
-    try:
-        import git_filter_repo  # noqa
+    try: import git_filter_repo  # noqa
     except ImportError:
         print("[filter-repo] installing git-filter-repo...")
-        _pip_install("git-filter-repo")
-        import git_filter_repo  # noqa
-
-    print(f"[filter-repo] stripping blobs > {max_mb} MB from history")
-    # Try CLI first (installed as `git-filter-repo` in PATH)
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install",
+                                   "--quiet", "git-filter-repo"])
+        except subprocess.CalledProcessError:
+            pass
     r = subprocess.run(
-        ["git", "filter-repo",
-         "--strip-blobs-bigger-than", f"{max_mb}M",
-         "--force"],
+        ["git", "filter-repo", "--strip-blobs-bigger-than", f"{max_mb}M", "--force"],
         capture_output=True, text=True)
     if r.returncode != 0:
-        # Fallback: python module
         r = subprocess.run(
             [sys.executable, "-m", "git_filter_repo",
              "--strip-blobs-bigger-than", f"{max_mb}M", "--force"],
             capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"filter-repo failed ({r.returncode}): "
-                           f"{(r.stderr or r.stdout or '').strip()[:400]}")
-
-    # filter-repo strips origin; restore
+        raise RuntimeError(f"filter-repo failed: {(r.stderr or r.stdout or '')[:400]}")
     if url:
         _git("remote", "add", "origin", url, quiet=True)
         _git_log(f"  re-added origin: {url}")
-
     _git("reflog", "expire", "--expire=now", "--all", quiet=True)
     _git("gc", "--prune=now", quiet=True)
     _git_log("  expired reflog and gc'd", "ok")
 
-# ====================================================================
-# Bootstrap plumbing
-# ====================================================================
+# ==================== Running-process detector ====================
+
+def _detect_running_main():
+    """Find any python process running this file. Returns list of ps lines."""
+    try:
+        me = os.getpid()
+        r = subprocess.run(["ps", "-eo", "pid,args"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode != 0: return []
+        lines = []
+        for line in r.stdout.splitlines():
+            if "main.py" not in line: continue
+            parts = line.strip().split(None, 1)
+            if len(parts) < 2: continue
+            try: pid = int(parts[0])
+            except ValueError: continue
+            if pid == me: continue
+            if "grep" in parts[1]: continue
+            lines.append(line.strip())
+        return lines
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+
+# ==================== Bootstrap plumbing ====================
 
 def _is_termux(): return "com.termux" in os.environ.get("PREFIX", "")
 def _has(cmd):    return shutil.which(cmd) is not None
 
 def _install_missing_tools():
-    for name, tux, deb, brew in (("git", "git", "git", "git"),
-                                 ("gh",  "gh",  "gh",  "gh")):
+    for name, tux, deb, brew in (("git","git","git","git"),
+                                 ("gh","gh","gh","gh")):
         if _has(name): continue
         print(f"[preflight] installing {name}...")
         if _is_termux():
             installer = "pkg" if _has("pkg") else "apt"
             _run([installer, "install", "-y", tux], capture_output=False)
         elif _has("apt-get"):
-            cmd = (["sudo", "apt-get", "install", "-y", deb] if _has("sudo")
-                   else ["apt-get", "install", "-y", deb])
+            cmd = (["sudo","apt-get","install","-y",deb] if _has("sudo")
+                   else ["apt-get","install","-y",deb])
             _run(cmd, capture_output=False)
         elif _has("brew"):
-            _run(["brew", "install", brew], capture_output=False)
+            _run(["brew","install",brew], capture_output=False)
         else:
-            print(f"[preflight] cannot install {name}: no package manager"); return False
+            print(f"[preflight] cannot install {name}"); return False
     return _has("git") and _has("gh")
 
 def _gh_authenticated():
     if not _has("gh"): return False
-    if _run(["gh", "auth", "status"]).returncode == 0: return True
+    if _run(["gh","auth","status"]).returncode == 0: return True
     token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if token:
         print("[preflight] trying gh auth via env token...")
-        _run(["gh", "auth", "login", "--with-token"], input=token)
-        if _run(["gh", "auth", "status"]).returncode == 0: return True
+        _run(["gh","auth","login","--with-token"], input=token)
+        if _run(["gh","auth","status"]).returncode == 0: return True
     hosts = Path.home() / ".config" / "gh" / "hosts.yml"
     return hosts.exists() and hosts.stat().st_size > 0
 
@@ -988,19 +857,19 @@ def _bump_tag(tag):
 def _parse_slug(url):
     s = url.rstrip("/")
     if s.endswith(".git"): s = s[:-4]
-    if "://" in s: s = s.split("://", 1)[1].split("/", 1)[1]
-    elif ":" in s and "@" in s: s = s.rsplit(":", 1)[-1]
+    if "://" in s: s = s.split("://",1)[1].split("/",1)[1]
+    elif ":" in s and "@" in s: s = s.rsplit(":",1)[-1]
     return s
 
 def _current_remote():
-    r = _git("remote", "get-url", "origin", quiet=True)
+    r = _git("remote","get-url","origin", quiet=True)
     return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
 
 def _default_repo_name():
     name = Path.cwd().name
-    if not name or name in ("~", "home", ".") or name.startswith("com."):
+    if not name or name in ("~","home",".") or name.startswith("com."):
         return "herniation-triage"
-    return re.sub(r"[^A-Za-z0-9._-]", "-", name)
+    return re.sub(r"[^A-Za-z0-9._-]","-",name)
 
 def _resolve_remote(args):
     if args.repo:
@@ -1011,153 +880,170 @@ def _resolve_remote(args):
     if not _has("gh"):
         print("[remote] no origin and gh not installed"); return None
     name = args.repo_name or _default_repo_name()
-    r = _gh("repo", "view", name, "--json", "url", "--jq", ".url")
+    r = _gh("repo","view",name,"--json","url","--jq",".url")
     if r.returncode == 0 and r.stdout.strip():
         url = f"https://github.com/{_parse_slug(r.stdout.strip())}.git"
         print(f"[remote] found existing repo: {url}"); return url
     print(f"[remote] creating repo '{name}'...")
     flag = "--private" if args.private else "--public"
-    r = _gh("repo", "create", name, "--source=.", "--remote=origin", flag)
+    r = _gh("repo","create",name,"--source=.","--remote=origin",flag)
     if r.returncode != 0:
         print(f"[remote] gh repo create failed: {r.stderr.strip()}"); return None
-    r2 = _gh("repo", "view", name, "--json", "url", "--jq", ".url")
+    r2 = _gh("repo","view",name,"--json","url","--jq",".url")
     if r2.returncode != 0: return None
     return f"https://github.com/{_parse_slug(r2.stdout.strip())}.git"
 
 def _set_origin(url):
-    if _current_remote(): _git("remote", "set-url", "origin", url, quiet=True)
-    else:                 _git("remote", "add", "origin", url, quiet=True)
+    if _current_remote(): _git("remote","set-url","origin",url, quiet=True)
+    else:                 _git("remote","add","origin",url, quiet=True)
 
 def _ensure_identity():
-    if _git("config", "--get", "user.email", quiet=True).returncode != 0:
+    if _git("config","--get","user.email", quiet=True).returncode != 0:
         email = "bootstrap@local"
         if _has("gh"):
-            rr = _gh("api", "user", "--jq", ".email // empty")
+            rr = _gh("api","user","--jq",".email // empty")
             if rr.returncode == 0 and rr.stdout.strip(): email = rr.stdout.strip()
-        _git("config", "user.email", email, quiet=True)
-    if _git("config", "--get", "user.name", quiet=True).returncode != 0:
+        _git("config","user.email",email, quiet=True)
+    if _git("config","--get","user.name", quiet=True).returncode != 0:
         name = "Herniation Bootstrap"
         if _has("gh"):
-            rr = _gh("api", "user", "--jq", ".login // empty")
+            rr = _gh("api","user","--jq",".login // empty")
             if rr.returncode == 0 and rr.stdout.strip(): name = rr.stdout.strip()
-        _git("config", "user.name", name, quiet=True)
+        _git("config","user.name",name, quiet=True)
 
 def _commit_all(msg):
-    """Stage (selective in $HOME) and commit."""
     if _in_home_dir():
-        print("[git] selective staging (running in $HOME)")
+        print("[git] selective staging (in $HOME)")
         for p in _safe_paths():
             path = Path(p)
             if path.exists():
-                _git("add", "--", str(path), quiet=True)
+                _git("add","--",str(path), quiet=True)
                 _git_log(f"  staged: {p}")
     else:
-        _git("add", "-A")
-    if _git("diff", "--cached", "--quiet", quiet=True).returncode != 0:
-        _git("commit", "-m", msg)
+        _git("add","-A")
+    if _git("diff","--cached","--quiet", quiet=True).returncode != 0:
+        _git("commit","-m",msg)
     else:
-        _git_log("nothing to commit (working tree clean)")
+        _git_log("nothing to commit (clean)")
 
 def _ensure_branch(name):
-    cur = _git("rev-parse", "--abbrev-ref", "HEAD", quiet=True)
+    cur = _git("rev-parse","--abbrev-ref","HEAD", quiet=True)
     cur_name = cur.stdout.strip() if cur.returncode == 0 else ""
     if cur_name == name: return
-    if _git("rev-parse", "--verify", "HEAD", quiet=True).returncode == 0:
-        _git("branch", "-M", name)
+    if _git("rev-parse","--verify","HEAD", quiet=True).returncode == 0:
+        _git("branch","-M",name)
     else:
-        _git("checkout", "-b", name)
+        _git("checkout","-b",name)
 
 def _push_branch(branch, stream=False):
     url = _current_remote()
     if not url:
-        print("[push] ERROR: no origin remote"); return False
+        print("[push] ERROR: no origin"); return False
     print(f"[push] remote: {url}"); print(f"[push] branch: {branch}")
 
     print("[push] strategy 1/4: direct push...")
-    r = _git("push", "-u", "origin", branch, stream=stream, timeout=1800)
+    r = _git("push","-u","origin",branch, stream=stream, timeout=1800)
     if r.returncode == 0: print("[push] OK (direct)"); return True
     print("[push] strategy 1/4 failed")
+    if "GH001" in _PUSH_LAST_ERR.get("stderr","") or \
+       "exceeds GitHub" in _PUSH_LAST_ERR.get("stderr",""):
+        print("[push] GH001 -- no fallback helps"); return False
 
-    # Fast-exit: GitHub already gave us the verdict
-    err_txt = _PUSH_LAST_ERR.get("stderr", "")
-    if "GH001" in err_txt or "exceeds GitHub" in err_txt:
-        print("[push] detected GH001 (large file) -- no fallback will help")
-        return False
-
-    heads = _git("ls-remote", "--heads", "origin", branch, quiet=True)
+    heads = _git("ls-remote","--heads","origin",branch, quiet=True)
     if heads.returncode == 0 and heads.stdout.strip():
         print("[push] strategy 2/4: fetch + push...")
-        _git("fetch", "origin", branch)
-        r = _git("push", "-u", "origin", branch, stream=stream, timeout=1800)
+        _git("fetch","origin",branch)
+        r = _git("push","-u","origin",branch, stream=stream, timeout=1800)
         if r.returncode == 0: print("[push] OK (fetch+push)"); return True
         print("[push] strategy 2/4 failed")
     else:
-        print("[push] strategy 2/4 skipped (remote branch absent)")
+        print("[push] strategy 2/4 skipped (branch absent)")
 
     token = _get_gh_token()
     if token and "github.com" in url:
         print("[push] strategy 3/4: token URL...")
         slug = _parse_slug(url)
         token_url = f"https://x-access-token:{token}@github.com/{slug}.git"
-        r = _git("push", token_url, f"HEAD:refs/heads/{branch}",
+        r = _git("push",token_url,f"HEAD:refs/heads/{branch}",
                  stream=stream, timeout=1800)
         if r.returncode == 0:
             print("[push] OK (via token)")
-            _git("remote", "set-url", "origin", url, quiet=True); return True
+            _git("remote","set-url","origin",url, quiet=True); return True
         print("[push] strategy 3/4 failed")
-        if "rejected" in (_PUSH_LAST_ERR.get("stderr") or ""):
-            print("[push] strategy 3b/4: force-with-lease via token...")
-            r = _git("push", "--force-with-lease", token_url,
-                     f"HEAD:refs/heads/{branch}", timeout=1800)
-            if r.returncode == 0:
-                print("[push] OK (forced)")
-                _git("remote", "set-url", "origin", url, quiet=True); return True
-            print("[push] strategy 3b/4 failed")
     else:
-        print("[push] strategy 3/4 skipped (no gh token)")
+        print("[push] strategy 3/4 skipped (no token)")
 
     if "github.com" in url:
         print("[push] strategy 4/4: SSH...")
         slug = _parse_slug(url)
         ssh_url = f"git@github.com:{slug}.git"
-        r = _git("push", ssh_url, f"HEAD:refs/heads/{branch}",
+        r = _git("push",ssh_url,f"HEAD:refs/heads/{branch}",
                  stream=stream, timeout=1800)
         if r.returncode == 0:
             print("[push] OK (via SSH)")
-            _git("remote", "set-url", "origin", ssh_url, quiet=True); return True
+            _git("remote","set-url","origin",ssh_url, quiet=True); return True
         print("[push] strategy 4/4 failed")
 
-    print("[push] ALL STRATEGIES FAILED")
-    return False
+    print("[push] ALL STRATEGIES FAILED"); return False
 
 def _tag_and_push(tag):
-    if not _git("tag", "-l", tag, quiet=True).stdout.strip():
-        _git("tag", "-a", tag, "-m", f"Release {tag}")
-    local = _git("rev-parse", tag, quiet=True)
+    if not _git("tag","-l",tag, quiet=True).stdout.strip():
+        _git("tag","-a",tag,"-m",f"Release {tag}")
+    local = _git("rev-parse",tag, quiet=True)
     sha = local.stdout.strip() if local.returncode == 0 else ""
     if sha:
-        r = _git("ls-remote", "--tags", "origin", f"refs/tags/{tag}", quiet=True)
+        r = _git("ls-remote","--tags","origin",f"refs/tags/{tag}", quiet=True)
         if r.returncode == 0 and sha in r.stdout:
             print(f"[git] tag {tag} already on remote"); return True
     print(f"[git] pushing tag {tag}...")
-    if _git("push", "origin", tag).returncode == 0:
+    if _git("push","origin",tag).returncode == 0:
         print(f"[git] tag {tag} pushed"); return True
     token = _get_gh_token(); url = _current_remote()
     if token and url and "github.com" in url:
         slug = _parse_slug(url)
         token_url = f"https://x-access-token:{token}@github.com/{slug}.git"
-        if _git("push", token_url, tag).returncode == 0:
+        if _git("push",token_url,tag).returncode == 0:
             print(f"[git] tag {tag} pushed (via token)"); return True
     print(f"[git] tag {tag} push failed"); return False
 
 def _analyse():
     script = str(Path(__file__).resolve())
     print("[analyse] py_compile...")
-    if _run([sys.executable, "-m", "py_compile", script]).returncode != 0:
+    if _run([sys.executable,"-m","py_compile",script]).returncode != 0:
         return 1
+    if not _NP_OK:
+        print("[analyse] skipping selftest (numpy not installed locally)")
+        print("[analyse] CI will install numpy/scipy and run the build")
+        return 0
     print("[analyse] selftest...")
     return _run([sys.executable, script, "selftest"],
                 capture_output=False).returncode
+
+def run_selftest():
+    if not _NP_OK:
+        print("[selftest] SKIP: numpy not installed"); return 0
+    print("[selftest] verifying core functions...")
+    big = np.full((500, 2), 1e-3)
+    if preprocess(big, 250) is not None:
+        print("[selftest] FAIL"); return 1
+    rng = np.random.default_rng(0)
+    normal = 20e-6 * rng.standard_normal((500, 2))
+    if preprocess(normal, 250) is None:
+        print("[selftest] FAIL"); return 1
+    hri = compute_hri({"DAR_log":0.0,"BSI":0.0,"persistence":1.0})
+    if not (0.0 <= hri <= 1.0):
+        print(f"[selftest] FAIL: {hri}"); return 1
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv",
+                                     delete=False, newline="") as f:
+        w = csv.writer(f); w.writerow(["t","ch1","ch2"])
+        for i in range(500):
+            w.writerow([f"{i/250:.6f}","0.000020","0.000020"])
+        tmp = Path(f.name)
+    try:
+        arr, fs = _load_csv(tmp, 250)
+        if arr.shape != (500,2): print("[selftest] FAIL: shape"); return 1
+    finally: tmp.unlink(missing_ok=True)
+    print("[selftest] OK"); return 0
 
 def _print_success(url, tag):
     slug = _parse_slug(url)
@@ -1169,16 +1055,11 @@ def _print_success(url, tag):
     print(f" Tag:     {tag}")
     print(f" Actions: https://github.com/{slug}/actions")
     print()
-    print(" Desktop workflow:   cold ~3-5 min,  warm ~1-2 min")
-    print(" Android workflow:   cold ~35-45 min, warm ~6-10 min  (cache HIT)")
+    print(" Desktop:  cold ~3-5 min,  warm ~1-2 min")
+    print(" Android:  cold ~35-45 min, warm ~6-10 min  (cache HIT)")
     print()
-    print(" Download artifacts from:")
-    print(f"   https://github.com/{slug}/actions")
+    print(f" Download artifacts: https://github.com/{slug}/actions")
     print("=" * 64)
-
-# --------------------------------------------------------------------
-# Home directory guard
-# --------------------------------------------------------------------
 
 def _warn_if_home(args):
     cwd = Path.cwd().resolve(); home = Path.home().resolve()
@@ -1186,32 +1067,18 @@ def _warn_if_home(args):
     print()
     print("!" * 68)
     print("  WARNING: Bootstrap is running from your HOME directory")
-    print(f"    cwd  = {cwd}")
-    print(f"    home = {home}")
-    print()
-    print("  Safe mode is active:")
-    print("    - only these paths will be staged:")
-    for p in _safe_paths():
-        print(f"        {p}")
-    print("    - add more paths via a '.bootstrap-include' file")
-    print("    - poisoned git history (large blobs) will be nuked")
-    print("      automatically if the remote is still empty")
+    print("  Safe mode active -- only these paths will be staged:")
+    for p in _safe_paths(): print(f"        {p}")
     print("!" * 68)
     if args.force:
-        print("  --force given; continuing")
-        return True
+        print("  --force given; continuing"); return True
     if not sys.stdin.isatty():
-        print("  (no TTY; continuing anyway)")
-        return True
-    try:
-        ans = input("  Continue anyway? [y/N] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return False
+        print("  (no TTY; continuing)"); return True
+    try: ans = input("  Continue anyway? [y/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt): return False
     return ans in ("y", "yes")
 
-# --------------------------------------------------------------------
-# Bootstrap core
-# --------------------------------------------------------------------
+# ==================== Bootstrap ====================
 
 def _bootstrap_once(args):
     cmd_setup_github()
@@ -1220,59 +1087,58 @@ def _bootstrap_once(args):
 
     root = Path.cwd()
     if not (root / ".git").is_dir():
-        _git("init", "-b", args.branch)
+        _git("init","-b",args.branch)
     _ensure_branch(args.branch)
     _ensure_identity()
 
-    # Resolve remote FIRST so we can inspect its state
     url = _resolve_remote(args)
     if not url: return False, "remote"
 
-    # -------------------------------------------------------------
-    # POISONED-HISTORY DETECTION  (the actual fix for GH001)
-    # -------------------------------------------------------------
     if not args.keep_history:
         big_blobs = _history_has_blobs_over(40)
         if big_blobs:
-            print(f"[bootstrap] history contains {len(big_blobs)} blob(s) > 40 MB:")
+            print(f"[bootstrap] history has {len(big_blobs)} blob(s) > 40 MB:")
             for size, oid in big_blobs[:5]:
                 print(f"[bootstrap]   {size/1024/1024:8.1f} MB  {oid[:12]}")
-            if len(big_blobs) > 5:
-                print(f"[bootstrap]   ... and {len(big_blobs) - 5} more")
-
             remote_state = _remote_has_commits(url)
             if remote_state is False:
-                print("[bootstrap] remote is empty -> nuking .git for clean restart")
+                print("[bootstrap] remote empty -> nuking .git")
                 _nuke_git_and_reinit(args.branch)
                 _ensure_identity()
                 url = _resolve_remote(args) or url
             elif remote_state is True:
-                print("[bootstrap] remote populated -> running filter-repo")
-                try:
-                    _purge_large_blobs(url, max_mb=40)
+                print("[bootstrap] remote populated -> filter-repo")
+                try: _purge_large_blobs(url, max_mb=40)
                 except Exception as e:
-                    print(f"[bootstrap] filter-repo failed: {e}")
-                    print("[bootstrap] cannot safely fix; use a fresh dir or --nuke-history")
-                    return False, "size"
+                    print(f"[bootstrap] filter-repo failed: {e}"); return False, "size"
                 _ensure_identity()
                 url = _resolve_remote(args) or url
             else:
-                print("[bootstrap] remote state unknown; will attempt push anyway")
+                print("[bootstrap] remote state unknown; pushing anyway")
 
     _untrack_junk()
     _commit_all(f"bootstrap: {time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    if _git("rev-parse", "--verify", "HEAD", quiet=True).returncode != 0:
-        print("[bootstrap] no commits after _commit_all"); return False, "analyse"
+    head = _git("rev-parse","HEAD", quiet=True)
+    if head.returncode != 0:
+        print("[bootstrap] no commits"); return False, "analyse"
+    head_sha = head.stdout.strip()
 
-    if not _repo_health_check():
-        return False, "size"
+    if not _repo_health_check(): return False, "size"
+
+    if args.tag:
+        existing = _git("rev-parse",f"refs/tags/{args.tag}", quiet=True)
+        if existing.returncode == 0:
+            tag_sha = existing.stdout.strip()
+            if tag_sha and tag_sha != head_sha:
+                old = args.tag; args.tag = _bump_tag(args.tag)
+                print(f"[bootstrap] tag {old} -> {tag_sha[:8]}, "
+                      f"HEAD -> {head_sha[:8]}; bumped to {args.tag}")
 
     _set_origin(url)
     if not _push_branch(args.branch, stream=args.stream_progress):
-        # Last-ditch: GH001 came back despite pre-check -> nuke & retry once
-        if "GH001" in _PUSH_LAST_ERR.get("stderr", ""):
-            print("[recovery] GH001 after push; attempting one more nuke")
+        if "GH001" in _PUSH_LAST_ERR.get("stderr",""):
+            print("[recovery] GH001; retrying nuke")
             if _remote_has_commits(url) is False:
                 _nuke_git_and_reinit(args.branch)
                 _ensure_identity()
@@ -1290,9 +1156,51 @@ def _bootstrap_once(args):
     return True, args.tag
 
 def cmd_bootstrap(args):
-    print("=" * 64)
-    print(" SELF-HEALING BOOTSTRAP -- push code, GitHub builds")
-    print("=" * 64)
+    # -------- UNMISTAKABLE BANNER --------
+    print()
+    print("=" * 68)
+    print(f" BOOTSTRAP STARTED  {time.strftime('%Y-%m-%d %H:%M:%S')}  "
+          f"(PID {os.getpid()})")
+    print("=" * 68)
+    print(" This command pushes code to GitHub.  It prints [git] / [push]")
+    print(" lines and exits in ~15 seconds.  It NEVER prints HRI/BSI/DAR.")
+    print(" If you see HRI/BSI/DAR after this banner, another `python`")
+    print(" process is printing to your terminal -- kill it as shown below.")
+    print("=" * 68)
+    print()
+
+    # -------- REFUSE IF ANY main.py PROCESS IS ALREADY RUNNING --------
+    procs = _detect_running_main()
+    if procs:
+        print("[bootstrap] FATAL: another 'main.py' process is already running:")
+        for p in procs: print(f"  {p}")
+        print()
+        print("[bootstrap] Its output will interleave with bootstrap and")
+        print("[bootstrap] confuse you.  Kill it first:")
+        print()
+        for p in procs:
+            pid = p.split()[0]
+            print(f"    kill -9 {pid}")
+        print()
+        if args.kill_stuck:
+            print("[bootstrap] --kill-stuck given; killing them now...")
+            for p in procs:
+                pid = p.split()[0]
+                try:
+                    subprocess.run(["kill","-9",pid], capture_output=True)
+                except Exception: pass
+            time.sleep(0.7)
+            remaining = _detect_running_main()
+            if remaining:
+                print("[bootstrap] still running after kill -9:")
+                for p in remaining: print(f"  {p}")
+                print("[bootstrap] aborting"); return 1
+            print("[bootstrap] all clear; continuing")
+        else:
+            print("[bootstrap] re-run with --kill-stuck to auto-kill.")
+            return 1
+        print()
+
     if not _warn_if_home(args):
         print("[bootstrap] aborted by user"); return 1
     if not _install_missing_tools():
@@ -1300,9 +1208,9 @@ def cmd_bootstrap(args):
     if not _gh_authenticated():
         print("[bootstrap] FATAL: gh not authenticated.")
         print("  One-time:  gh auth login")
-        print("  Or set:    export GH_TOKEN=<token>")
         return 2
-    _run(["gh", "auth", "setup-git"])
+    _run(["gh","auth","setup-git"])
+
     for attempt in range(1, args.max_attempts + 1):
         print(); print(f"----- attempt {attempt}/{args.max_attempts} -----")
         try:
@@ -1313,48 +1221,20 @@ def cmd_bootstrap(args):
             ok, reason = False, f"exception: {e}"
         if ok: return 0
         print(f"[bootstrap] attempt {attempt} failed: {reason}")
-        if reason in ("analyse", "size"):
-            print(f"[bootstrap] fatal ({reason}); needs manual fix"); return 3
+        if reason in ("analyse","size"):
+            print(f"[bootstrap] fatal ({reason})"); return 3
         if attempt < args.max_attempts:
-            if reason == "push":
-                probe = _git("ls-remote", "--heads", "origin", "HEAD", quiet=True)
-                if probe.returncode != 0:
-                    print("[recovery] remote unreachable; aborting")
-                    return 4
-                heads = _git("ls-remote", "--heads", "origin", args.branch, quiet=True)
-                if heads.returncode == 0 and heads.stdout.strip():
-                    print("[recovery] remote has branch, fetching + rebasing")
-                    _git("fetch", "origin")
-                    _git("pull", "--rebase", "origin", args.branch)
-                else:
-                    print("[recovery] remote branch absent, retrying push")
-            elif reason == "tag":
-                args.tag = _bump_tag(args.tag)
-                print(f"[recovery] bumping tag to {args.tag}")
             time.sleep(2)
-    print("[bootstrap] gave up after max attempts"); return 4
-
-# --------------------------------------------------------------------
-# Standalone clean-history command
-# --------------------------------------------------------------------
+    print("[bootstrap] gave up"); return 4
 
 def cmd_clean_history(args):
-    print("=" * 64)
-    print(" HISTORY CLEANUP -- strip large blobs from git")
-    print("=" * 64)
-    if not Path(".git").is_dir():
-        print("[clean-history] no .git directory here"); return 1
+    print("=" * 64); print(" HISTORY CLEANUP"); print("=" * 64)
+    if not Path(".git").is_dir(): print("[clean-history] no .git"); return 1
     url = _current_remote() or args.repo
-    if not url:
-        print("[clean-history] no origin remote; pass --repo <url>"); return 1
-
+    if not url: print("[clean-history] no origin; pass --repo <url>"); return 1
     big = _history_has_blobs_over(40)
-    if not big:
-        print("[clean-history] no blobs > 40 MB in history; nothing to do"); return 0
+    if not big: print("[clean-history] nothing to do"); return 0
     print(f"[clean-history] found {len(big)} blob(s) > 40 MB")
-    for size, oid in big[:5]:
-        print(f"[clean-history]   {size/1024/1024:8.1f} MB  {oid[:12]}")
-
     remote_state = _remote_has_commits(url)
     if remote_state is False or args.nuke_history:
         print("[clean-history] nuking .git")
@@ -1362,65 +1242,56 @@ def cmd_clean_history(args):
         _ensure_identity()
         _commit_all(f"clean: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         _set_origin(url)
-        if not _repo_health_check():
-            print("[clean-history] working tree still has large tracked files"); return 1
-        if not _push_branch(args.branch, stream=args.stream_progress):
-            print("[clean-history] push failed"); return 1
+        if not _repo_health_check(): return 1
+        if not _push_branch(args.branch, stream=args.stream_progress): return 1
     elif remote_state is True:
         print("[clean-history] running filter-repo")
-        try:
-            _purge_large_blobs(url, max_mb=40)
-        except Exception as e:
-            print(f"[clean-history] filter-repo failed: {e}"); return 1
+        try: _purge_large_blobs(url, max_mb=40)
+        except Exception as e: print(f"[clean-history] failed: {e}"); return 1
         _set_origin(url)
-        print("[clean-history] history rewritten; pushing with --force-with-lease")
-        r = _git("push", "--force-with-lease", "origin", args.branch)
-        if r.returncode != 0:
-            print("[clean-history] force push failed"); return 1
+        r = _git("push","--force-with-lease","origin",args.branch)
+        if r.returncode != 0: print("[clean-history] force push failed"); return 1
     else:
-        print("[clean-history] remote unknown; refusing to proceed"); return 1
-
-    print("[clean-history] done.  Run 'python main.py bootstrap' to re-tag & release.")
+        print("[clean-history] remote unknown; refusing"); return 1
+    print("[clean-history] done.")
     return 0
-
-# --------------------------------------------------------------------
-# Clone
-# --------------------------------------------------------------------
 
 def cmd_clone(args):
     url = args.repo
-    if not url:
-        print("[clone] ERROR: --repo <url> required"); return 1
+    if not url: print("[clone] ERROR: --repo <url> required"); return 1
     dest = Path(args.dest) if args.dest else Path(_default_repo_name())
     if dest.exists() and any(dest.iterdir()):
-        print(f"[clone] target {dest} exists and is not empty; refusing"); return 1
+        print(f"[clone] {dest} exists and not empty; refusing"); return 1
     extra = []
     if args.depth:  extra.extend(["--depth", str(args.depth)])
     if args.branch: extra.extend(["--branch", args.branch])
     print(f"[clone] cloning {url} -> {dest}")
-    r = _git("clone", *extra, url, str(dest), stream=args.stream_progress)
-    if r.returncode == 0:
-        print(f"[clone] OK -> {dest}"); return 0
+    r = _git("clone",*extra,url,str(dest), stream=args.stream_progress)
+    if r.returncode == 0: print(f"[clone] OK -> {dest}"); return 0
     print("[clone] FAILED"); return 1
 
-# --------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------
+# ==================== Entry point ====================
 
 def main():
+    is_frozen = getattr(sys, "frozen", False)
+    argv = sys.argv[1:]
+
+    # Only enter GUI when there are ZERO args AND we are truly in an APK
+    # or a frozen (double-clicked) executable.  Never intercept CLI args.
+    if not argv:
+        if _is_apk_runtime():
+            return _launch_gui("mobile")
+        if is_frozen:
+            return _launch_gui("desktop")
+
     ap = argparse.ArgumentParser(
-        description="Herniation Triage -- push code, GitHub builds everything.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        prog="main.py",
+        description="Herniation Triage. Run 'bootstrap' to push to GitHub.",
     )
     ap.add_argument("command",
-                    choices=["bootstrap", "run", "make-sample", "selftest",
-                             "setup-github", "build-desktop", "build-android",
-                             "clone", "clean-history"])
+                    choices=["bootstrap","make-sample","selftest",
+                             "setup-github","clean-history","clone","gui"])
     ap.add_argument("--file", type=Path)
-    ap.add_argument("--file-fs", type=float, default=None)
-    ap.add_argument("--loop", action="store_true")
-    ap.add_argument("--cli", action="store_true")
-    ap.add_argument("--mobile", action="store_true")
     ap.add_argument("--repo", default=None)
     ap.add_argument("--repo-name", default=None)
     ap.add_argument("--tag", default="v1.0.0")
@@ -1428,48 +1299,28 @@ def main():
     ap.add_argument("--private", action="store_true")
     ap.add_argument("--max-attempts", type=int, default=5)
     ap.add_argument("--skip-analyse", action="store_true")
-    ap.add_argument("--force", action="store_true",
-                    help="continue even when run from $HOME")
-    ap.add_argument("--git-quiet", action="store_true",
-                    help="suppress per-operation git logs")
-    ap.add_argument("--dest", type=Path, default=None,
-                    help="(clone) destination directory")
-    ap.add_argument("--depth", type=int, default=0,
-                    help="(clone) shallow clone depth")
-    ap.add_argument("--nuke-history", action="store_true",
-                    help="always delete .git when poison detected")
-    ap.add_argument("--keep-history", action="store_true",
-                    help="never rewrite history (push will likely fail)")
-    ap.add_argument("--stream-progress", action="store_true",
-                    help="stream git push progress live")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--git-quiet", action="store_true")
+    ap.add_argument("--dest", type=Path, default=None)
+    ap.add_argument("--depth", type=int, default=0)
+    ap.add_argument("--nuke-history", action="store_true")
+    ap.add_argument("--keep-history", action="store_true")
+    ap.add_argument("--stream-progress", action="store_true")
+    ap.add_argument("--kill-stuck", action="store_true")
     args = ap.parse_args()
 
-    if args.git_quiet:
-        _LOG["git"] = False
-
-    CFG.update(PROFILES["mobile" if args.mobile else "desktop"])
+    if args.git_quiet: _LOG["git"] = False
 
     if args.command == "bootstrap":     sys.exit(cmd_bootstrap(args))
-    if args.command == "make-sample":   make_sample(fs=CFG["fs"]); return
-    if args.command == "selftest":      sys.exit(run_selftest(CFG))
+    if args.command == "make-sample":
+        p = make_sample(path=args.file or Path("sample_eeg.csv"))
+        sys.exit(0 if p else 1)
+    if args.command == "selftest":      sys.exit(run_selftest())
     if args.command == "setup-github":  cmd_setup_github(); return
-    if args.command == "build-desktop": cmd_build_desktop_local(); return
-    if args.command == "build-android": cmd_build_android_local(); return
-    if args.command == "clone":         sys.exit(cmd_clone(args))
     if args.command == "clean-history": sys.exit(cmd_clean_history(args))
+    if args.command == "clone":         sys.exit(cmd_clone(args))
+    if args.command == "gui":           return _launch_gui("desktop")
 
-    if args.command == "run":
-        if args.file is None:
-            sys.stderr.write(
-                "ERROR: --file required for 'run'.\n"
-                "  Generate fixture: python main.py make-sample\n"
-                "  Or pass your own: python main.py run --file eeg.csv\n")
-            sys.exit(2)
-        if not args.file.exists():
-            sys.stderr.write(f"ERROR: {args.file} does not exist\n"); sys.exit(2)
-        CFG["_file_fs"] = args.file_fs
-        if args.cli: sys.exit(run_cli(CFG, args.file, args.loop))
-        else:        run_gui(CFG, args.file, args.loop)
 
 if __name__ == "__main__":
     main()

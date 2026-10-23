@@ -9,8 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Restore Buildozer cache (GitHub-managed)
+      - name: Restore Buildozer cache
         id: cache
         uses: actions/cache@v4
         with:
@@ -21,24 +20,17 @@ jobs:
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'requirements.txt') }}
           restore-keys: |
             buildozer-${{ runner.os }}-
-
       - name: Report cache status
         run: |
-          echo "============= CACHE STATUS ============="
           if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
-            echo "CACHE HIT -- reusing previously downloaded NDK/SDK/p4a"
-            echo "Expected Android build time: ~6-10 minutes"
+            echo "CACHE HIT -- ~6-10 min"
           else
-            echo "CACHE MISS -- cold build, will download NDK/SDK/p4a"
-            echo "Expected Android build time: ~35-45 minutes"
+            echo "CACHE MISS -- ~35-45 min"
           fi
-          ls -d "$HOME/.buildozer/android/platform/android-ndk"* 2>/dev/null || true
           du -sh "$HOME/.buildozer" 2>/dev/null || true
-
       - name: Prepare cache dirs
         run: mkdir -p "$HOME/.buildozer" "$HOME/.cache/pip"
-
-      - name: Build APK (GitHub runner, Docker + cached volumes)
+      - name: Build APK
         run: |
           docker run --rm \
             --volume "$PWD":/home/user/hostcwd \
@@ -47,9 +39,7 @@ jobs:
             --workdir /home/user/hostcwd \
             kivy/buildozer:latest \
             buildozer -v android debug
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: HerniationTriage-Android
           path: bin/*.apk
