@@ -1,5 +1,6 @@
 name: Build Android APK
-"on":
+
+on:
   push:
     tags: ['v*']
   workflow_dispatch:
@@ -10,8 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Restore Buildozer cache
-        id: cache
+      - name: Restore Buildozer global cache
         uses: actions/cache@v4
         with:
           path: |
@@ -22,16 +22,7 @@ jobs:
           restore-keys: |
             buildozer-${{ runner.os }}-
 
-      - name: Report cache status
-        run: |
-          if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
-            echo "CACHE HIT -- ~6-10 min"
-          else
-            echo "CACHE MISS -- ~35-45 min"
-          fi
-          du -sh "$HOME/.buildozer" 2>/dev/null || true
-
-      - name: Prepare cache dirs
+      - name: Prepare cache directories
         run: mkdir -p "$HOME/.buildozer" "$HOME/.cache/pip"
 
       - name: Build APK
@@ -42,9 +33,10 @@ jobs:
             --volume "$HOME/.cache/pip":/home/user/.cache/pip \
             --workdir /home/user/hostcwd \
             kivy/buildozer:latest \
-            buildozer -v android debug
+            -v android debug
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
           name: HerniationTriage-Android
           path: bin/*.apk
