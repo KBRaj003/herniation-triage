@@ -12,13 +12,37 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-      - name: Install dependencies
+
+      - name: Install Linux system dependencies for Kivy
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libmtdev-dev \
+            libgl1-mesa-dev \
+            libgles2-mesa-dev \
+            libsdl2-dev \
+            libsdl2-image-dev \
+            libsdl2-ttf-dev \
+            libsdl2-mixer-dev \
+            libgstreamer1.0-dev \
+            gstreamer1.0-plugins-base \
+            libx11-dev \
+            libxkbcommon-dev \
+            libdrm-dev \
+            libgbm-dev \
+            libegl1-mesa-dev \
+            libglib2.0-0
+
+      - name: Install Python dependencies
         run: pip install -r requirements.txt pyinstaller
-      - name: Patch kivy.garden __path__
+
+      - name: Patch kivy.garden __path__ (PyInstaller workaround)
         shell: bash
         run: |
           python - <<'PY'
@@ -33,6 +57,7 @@ jobs:
               else: print("already patched")
           else: print("kivy.garden not present")
           PY
+
       - name: Build executable
         run: >
           pyinstaller --onefile --windowed
@@ -41,7 +66,10 @@ jobs:
           --collect-data kivy
           --collect-binaries kivy
           --exclude-module kivy.garden
+          --exclude-module kivy.input.providers.mtdev
+          --exclude-module kivy.input.providers.probesysfs
           main.py
+
       - uses: actions/upload-artifact@v4
         with:
           name: HerniationTriage-${{ matrix.os }}

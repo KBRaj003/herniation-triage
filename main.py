@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
-# main.py -- Herniation Risk Triage.
-# Research prototype. Not a medical device.
+# main.py -- Herniation Risk Triage.  Research prototype. Not a medical device.
 #
-# NOTE: there is NO `run` command.  HRI/BSI/DAR replay only happens
-# inside the APK / desktop exe GUI, never in the terminal.
-# The only command you ever need is `bootstrap`.
+# Only command you need:  python main.py bootstrap
+# Pushes code + tag to GitHub; CI installs everything and builds APK + exes.
 
 import argparse, csv, os, re, shlex, shutil, subprocess, sys, tempfile, threading, time
 from collections import deque
@@ -103,7 +101,7 @@ def compute_hri(f):
     pers_s = 1.0 - f["persistence"]
     return float(np.clip(0.45 * dar_s + 0.35 * bsi_s + 0.20 * pers_s, 0, 1))
 
-# ==================== CSV source + pipeline ====================
+# ==================== CSV source + Pipeline ====================
 
 def _load_csv(path, target_fs, file_fs=None):
     with path.open("r", newline="") as f:
@@ -198,12 +196,30 @@ class Pipeline:
             self.running = False
     def stop(self): self.running = False
 
-# ==================== GUI (only runs inside APK / exe) ====================
+# ==================== GUI (runs inside APK / exe only) ====================
+
+def make_sample(path=Path("sample_eeg.csv"), fs=250, seconds=60, seed=42):
+    if not _NP_OK:
+        sys.stderr.write("ERROR: numpy required for make-sample.\n"); return None
+    path = Path(path)
+    if path.exists(): print(f"  (overwriting {path})")
+    n = int(fs * seconds); rng = np.random.default_rng(seed)
+    t = np.arange(n) / fs
+    left  = 20e-6 * np.sin(2*np.pi*10*t) + 0.5e-6 * rng.standard_normal(n)
+    right = 20e-6 * np.sin(2*np.pi*10*t + 0.1) + 0.5e-6 * rng.standard_normal(n)
+    event = (t > seconds / 2).astype(float)
+    left  = left  * (1 - 0.75 * event) + 30e-6 * np.sin(2*np.pi*2*t) * event
+    right = right + 5e-6 * np.sin(2*np.pi*2*t) * event
+    with path.open("w", newline="") as f:
+        w = csv.writer(f); w.writerow(["t", "ch1", "ch2"])
+        for i in range(n):
+            w.writerow([f"{t[i]:.6f}", f"{left[i]:.9f}", f"{right[i]:.9f}"])
+    print(f"Wrote {path} ({n} rows, {seconds}s @ {fs} Hz)")
+    return path
 
 def _launch_gui(profile="desktop"):
-    """Run GUI with auto-generated sample. Used by APK and desktop exe."""
     if not _NP_OK:
-        msg = "ERROR: numpy missing. Install: pip install numpy scipy"
+        msg = "ERROR: numpy missing"
         sys.stderr.write(msg + "\n")
         try:
             from kivy.app import App
@@ -317,33 +333,13 @@ def _launch_gui(profile="desktop"):
     TriApp().run()
     return 0
 
-def make_sample(path=Path("sample_eeg.csv"), fs=250, seconds=60, seed=42):
-    if not _NP_OK:
-        sys.stderr.write("ERROR: numpy required for make-sample.\n"); return None
-    path = Path(path)
-    if path.exists(): print(f"  (overwriting {path})")
-    n = int(fs * seconds); rng = np.random.default_rng(seed)
-    t = np.arange(n) / fs
-    left  = 20e-6 * np.sin(2*np.pi*10*t) + 0.5e-6 * rng.standard_normal(n)
-    right = 20e-6 * np.sin(2*np.pi*10*t + 0.1) + 0.5e-6 * rng.standard_normal(n)
-    event = (t > seconds / 2).astype(float)
-    left  = left  * (1 - 0.75 * event) + 30e-6 * np.sin(2*np.pi*2*t) * event
-    right = right + 5e-6 * np.sin(2*np.pi*2*t) * event
-    with path.open("w", newline="") as f:
-        w = csv.writer(f); w.writerow(["t", "ch1", "ch2"])
-        for i in range(n):
-            w.writerow([f"{t[i]:.6f}", f"{left[i]:.9f}", f"{right[i]:.9f}"])
-    kb = path.stat().st_size // 1024
-    print(f"Wrote {path} ({n} rows, {seconds}s @ {fs} Hz, ~{kb} KB)")
-    return path
-
-# ==================== Android detection ====================
+# ==================== Android APK detection ====================
 
 def _is_apk_runtime():
     """True ONLY inside a p4a-built APK (not on plain Termux)."""
     return "P4A_BOOTSTRAP" in os.environ or "ANDROID_ARGUMENT" in os.environ
 
-# ==================== Scaffold constants ====================
+# ==================== Scaffold ====================
 
 REQUIREMENTS_TXT = "kivy>=2.3.0,<2.4\nnumpy>=1.24,<3\nscipy>=1.10,<1.15\n"
 
@@ -429,6 +425,7 @@ Pushes to GitHub; Actions builds desktop executables + Android APK.
 Not a medical device.
 """
 
+# ---------- DESKTOP: fixed -- installs system deps, excludes mtdev ----------
 DESKTOP_WORKFLOW = """\
 name: Build Desktop Executables
 "on":
@@ -444,13 +441,37 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-      - name: Install dependencies
+
+      - name: Install Linux system dependencies for Kivy
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \\
+            libmtdev-dev \\
+            libgl1-mesa-dev \\
+            libgles2-mesa-dev \\
+            libsdl2-dev \\
+            libsdl2-image-dev \\
+            libsdl2-ttf-dev \\
+            libsdl2-mixer-dev \\
+            libgstreamer1.0-dev \\
+            gstreamer1.0-plugins-base \\
+            libx11-dev \\
+            libxkbcommon-dev \\
+            libdrm-dev \\
+            libgbm-dev \\
+            libegl1-mesa-dev \\
+            libglib2.0-0
+
+      - name: Install Python dependencies
         run: pip install -r requirements.txt pyinstaller
-      - name: Patch kivy.garden __path__
+
+      - name: Patch kivy.garden __path__ (PyInstaller workaround)
         shell: bash
         run: |
           python - <<'PY'
@@ -465,6 +486,7 @@ jobs:
               else: print("already patched")
           else: print("kivy.garden not present")
           PY
+
       - name: Build executable
         run: >
           pyinstaller --onefile --windowed
@@ -473,13 +495,17 @@ jobs:
           --collect-data kivy
           --collect-binaries kivy
           --exclude-module kivy.garden
+          --exclude-module kivy.input.providers.mtdev
+          --exclude-module kivy.input.providers.probesysfs
           main.py
+
       - uses: actions/upload-artifact@v4
         with:
           name: HerniationTriage-${{ matrix.os }}
           path: dist/*
 """
 
+# ---------- ANDROID: unchanged -- buildozer in Docker handles deps ----------
 ANDROID_WORKFLOW = """\
 name: Build Android APK
 "on":
@@ -492,6 +518,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Restore Buildozer cache
         id: cache
         uses: actions/cache@v4
@@ -503,6 +530,7 @@ jobs:
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'requirements.txt') }}
           restore-keys: |
             buildozer-${{ runner.os }}-
+
       - name: Report cache status
         run: |
           if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
@@ -511,8 +539,10 @@ jobs:
             echo "CACHE MISS -- ~35-45 min"
           fi
           du -sh "$HOME/.buildozer" 2>/dev/null || true
+
       - name: Prepare cache dirs
         run: mkdir -p "$HOME/.buildozer" "$HOME/.cache/pip"
+
       - name: Build APK
         run: |
           docker run --rm \\
@@ -522,6 +552,7 @@ jobs:
             --workdir /home/user/hostcwd \\
             kivy/buildozer:latest \\
             buildozer -v android debug
+
       - uses: actions/upload-artifact@v4
         with:
           name: HerniationTriage-Android
@@ -766,8 +797,7 @@ def _purge_large_blobs(url, max_mb=40):
         try:
             subprocess.check_call([sys.executable, "-m", "pip", "install",
                                    "--quiet", "git-filter-repo"])
-        except subprocess.CalledProcessError:
-            pass
+        except subprocess.CalledProcessError: pass
     r = subprocess.run(
         ["git", "filter-repo", "--strip-blobs-bigger-than", f"{max_mb}M", "--force"],
         capture_output=True, text=True)
@@ -788,7 +818,6 @@ def _purge_large_blobs(url, max_mb=40):
 # ==================== Running-process detector ====================
 
 def _detect_running_main():
-    """Find any python process running this file. Returns list of ps lines."""
     try:
         me = os.getpid()
         r = subprocess.run(["ps", "-eo", "pid,args"],
@@ -1156,49 +1185,36 @@ def _bootstrap_once(args):
     return True, args.tag
 
 def cmd_bootstrap(args):
-    # -------- UNMISTAKABLE BANNER --------
     print()
     print("=" * 68)
     print(f" BOOTSTRAP STARTED  {time.strftime('%Y-%m-%d %H:%M:%S')}  "
           f"(PID {os.getpid()})")
     print("=" * 68)
-    print(" This command pushes code to GitHub.  It prints [git] / [push]")
-    print(" lines and exits in ~15 seconds.  It NEVER prints HRI/BSI/DAR.")
-    print(" If you see HRI/BSI/DAR after this banner, another `python`")
-    print(" process is printing to your terminal -- kill it as shown below.")
-    print("=" * 68)
-    print()
+    print(" Pushes code to GitHub.  Prints [git]/[push] lines.  ~15 seconds.")
+    print("=" * 68); print()
 
-    # -------- REFUSE IF ANY main.py PROCESS IS ALREADY RUNNING --------
     procs = _detect_running_main()
     if procs:
-        print("[bootstrap] FATAL: another 'main.py' process is already running:")
+        print("[bootstrap] FATAL: another 'main.py' process is running:")
         for p in procs: print(f"  {p}")
-        print()
-        print("[bootstrap] Its output will interleave with bootstrap and")
-        print("[bootstrap] confuse you.  Kill it first:")
         print()
         for p in procs:
             pid = p.split()[0]
             print(f"    kill -9 {pid}")
         print()
         if args.kill_stuck:
-            print("[bootstrap] --kill-stuck given; killing them now...")
+            print("[bootstrap] --kill-stuck: killing them now...")
             for p in procs:
                 pid = p.split()[0]
-                try:
-                    subprocess.run(["kill","-9",pid], capture_output=True)
+                try: subprocess.run(["kill","-9",pid], capture_output=True)
                 except Exception: pass
             time.sleep(0.7)
             remaining = _detect_running_main()
             if remaining:
-                print("[bootstrap] still running after kill -9:")
-                for p in remaining: print(f"  {p}")
-                print("[bootstrap] aborting"); return 1
+                print("[bootstrap] still running; aborting"); return 1
             print("[bootstrap] all clear; continuing")
         else:
-            print("[bootstrap] re-run with --kill-stuck to auto-kill.")
-            return 1
+            print("[bootstrap] re-run with --kill-stuck to auto-kill."); return 1
         print()
 
     if not _warn_if_home(args):
@@ -1207,25 +1223,23 @@ def cmd_bootstrap(args):
         print("[bootstrap] FATAL: cannot install git/gh"); return 1
     if not _gh_authenticated():
         print("[bootstrap] FATAL: gh not authenticated.")
-        print("  One-time:  gh auth login")
-        return 2
+        print("  One-time:  gh auth login"); return 2
     _run(["gh","auth","setup-git"])
 
     for attempt in range(1, args.max_attempts + 1):
         print(); print(f"----- attempt {attempt}/{args.max_attempts} -----")
-        try:
-            ok, reason = _bootstrap_once(args)
+        try: ok, reason = _bootstrap_once(args)
         except KeyboardInterrupt:
             print("[bootstrap] interrupted"); return 130
-        except Exception as e:
-            ok, reason = False, f"exception: {e}"
+        except Exception as e: ok, reason = False, f"exception: {e}"
         if ok: return 0
         print(f"[bootstrap] attempt {attempt} failed: {reason}")
         if reason in ("analyse","size"):
             print(f"[bootstrap] fatal ({reason})"); return 3
-        if attempt < args.max_attempts:
-            time.sleep(2)
+        if attempt < args.max_attempts: time.sleep(2)
     print("[bootstrap] gave up"); return 4
+
+# ==================== Other commands ====================
 
 def cmd_clean_history(args):
     print("=" * 64); print(" HISTORY CLEANUP"); print("=" * 64)
@@ -1276,8 +1290,7 @@ def main():
     is_frozen = getattr(sys, "frozen", False)
     argv = sys.argv[1:]
 
-    # Only enter GUI when there are ZERO args AND we are truly in an APK
-    # or a frozen (double-clicked) executable.  Never intercept CLI args.
+    # GUI only when zero args AND truly in APK or frozen exe
     if not argv:
         if _is_apk_runtime():
             return _launch_gui("mobile")
@@ -1319,8 +1332,7 @@ def main():
     if args.command == "setup-github":  cmd_setup_github(); return
     if args.command == "clean-history": sys.exit(cmd_clean_history(args))
     if args.command == "clone":         sys.exit(cmd_clone(args))
-    if args.command == "gui":           return _launch_gui("desktop")
-
+    if args.command == "gui":           sys.exit(_launch_gui("desktop"))
 
 if __name__ == "__main__":
     main()

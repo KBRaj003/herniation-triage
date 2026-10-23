@@ -9,6 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - name: Restore Buildozer cache
         id: cache
         uses: actions/cache@v4
@@ -20,6 +21,7 @@ jobs:
           key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec', 'requirements.txt') }}
           restore-keys: |
             buildozer-${{ runner.os }}-
+
       - name: Report cache status
         run: |
           if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
@@ -28,8 +30,10 @@ jobs:
             echo "CACHE MISS -- ~35-45 min"
           fi
           du -sh "$HOME/.buildozer" 2>/dev/null || true
+
       - name: Prepare cache dirs
         run: mkdir -p "$HOME/.buildozer" "$HOME/.cache/pip"
+
       - name: Build APK
         run: |
           docker run --rm \
@@ -39,6 +43,7 @@ jobs:
             --workdir /home/user/hostcwd \
             kivy/buildozer:latest \
             buildozer -v android debug
+
       - uses: actions/upload-artifact@v4
         with:
           name: HerniationTriage-Android
